@@ -1,4 +1,4 @@
-"""Jo-box app v5.2.1: triple watcher — FLOP, RackNerd, Delphi (24/7).
+"""Jo-box app v5.2.2: triple watcher — FLOP, RackNerd, Delphi (24/7).
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.2.1"
+VERSION = "v5.2.2"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -94,11 +94,12 @@ def alert(source, msg):
     if hook:
         try:
             req = urllib.request.Request(hook, data=json.dumps({"content": line}).encode(),
-                                         headers={"Content-Type": "application/json"}, method="POST")
+                                         headers={**UA, "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as r:
                 log(f"WEBHOOK OK {r.status}", flush=True)
         except urllib.error.HTTPError as e:
-            log(f"WEBHOOK FAIL: HTTPError {e.code}", flush=True)
+            body = e.read()[:200].decode("utf-8", "replace")
+            log(f"WEBHOOK FAIL: HTTPError {e.code} {body}", flush=True)
         except Exception as e:
             log(f"WEBHOOK FAIL: {type(e).__name__}: {e}", flush=True)
 
@@ -368,12 +369,13 @@ def load_private_config():
         try:
             req = urllib.request.Request(
                 hook,
-                data=json.dumps({"content": "Jo-box v5.2 online — triple watcher aktif (FLOP + RackNerd + Delphi)"}).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
+                data=json.dumps({"content": "Jo-box v5.2.2 online — triple watcher aktif (FLOP + RackNerd + Delphi)"}).encode(),
+                headers={**UA, "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 print(f"CONFIG: webhook boot test OK {resp.status}", flush=True)
         except urllib.error.HTTPError as e:
-            print(f"CONFIG: webhook boot test FAIL HTTPError {e.code}", flush=True)
+            body = e.read()[:200].decode("utf-8", "replace")
+            print(f"CONFIG: webhook boot test FAIL HTTPError {e.code} {body}", flush=True)
         except Exception as e:
             print(f"CONFIG: webhook boot test FAIL {type(e).__name__}", flush=True)
     except Exception as e:
