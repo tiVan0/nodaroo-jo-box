@@ -1,4 +1,4 @@
-"""Jo-box app v5.1: triple watcher — FLOP, RackNerd, Delphi (24/7).
+"""Jo-box app v5.2: triple watcher — FLOP, RackNerd, Delphi (24/7).
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -10,7 +10,9 @@
   back off 10 min. VM cron stays authoritative for RackNerd.
 - Delphi: GET https://competition.delphi.fyi/markets.json every 5 min;
   alert once when it answers 200 with real JSON (currently 404).
-Alert sinks: Discord webhook (DISCORD_WEBHOOK env, once wired),
+Alert sinks: Discord webhook (DISCORD_WEBHOOK env, or config.json in the
+private repo tiVan0/jo-box-secrets, cloned at boot with USERNAME +
+ACCESS_TOKEN — the token is never logged or kept on disk),
 HTTP /status on the allocation port (Jo polls it), console + state.json.
 Self-update: hourly `git pull`; if app.py changed and compiles, reload.
 The panel console is NOT a shell (input goes to stdin).
@@ -32,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.1"
+VERSION = "v5.2"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -329,6 +331,51 @@ def run(cmd):
         return False
 
 
+def load_private_config():
+    """Clone the private config repo (if USERNAME+ACCESS_TOKEN are set) and
+    read DISCORD_WEBHOOK from config/config.json. The token is NEVER printed
+    or stored: the clone URL lives only in memory, stderr is discarded, and
+    the remote URL is stripped right after cloning. Any failure leaves the
+    watchers running without a webhook. On success, posts one boot-test
+    message so the wiring is proven end-to-end immediately."""
+    user = os.environ.get("USERNAME")
+    token = os.environ.get("ACCESS_TOKEN")
+    if not user or not token:
+        print("CONFIG: no USERNAME/ACCESS_TOKEN — webhook stays off", flush=True)
+        return
+    repo = "tiVan0/jo-box-secrets"
+    try:
+        shutil.rmtree("config", ignore_errors=True)
+        url = f"https://{user}:{token}@github.com/{repo}.git"
+        r = subprocess.run(["git", "clone", "--depth", "1", url, "config"],
+                           timeout=60, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"CONFIG: clone FAIL rc={r.returncode} — webhook stays off", flush=True)
+            return
+        subprocess.run(["git", "-C", "config", "remote", "set-url", "origin",
+                        f"https://github.com/{repo}.git"],
+                       timeout=30, capture_output=True, text=True)
+        with open("config/config.json") as f:
+            cfg = json.load(f)
+        hook = cfg.get("DISCORD_WEBHOOK", "")
+        if not hook.startswith("https://discord.com/api/webhooks/"):
+            print("CONFIG: config.json has no valid DISCORD_WEBHOOK — webhook stays off", flush=True)
+            return
+        os.environ["DISCORD_WEBHOOK"] = hook
+        print("CONFIG OK: webhook loaded (private repo)", flush=True)
+        try:
+            req = urllib.request.Request(
+                hook,
+                data=json.dumps({"content": "Jo-box v5.2 online — triple watcher aktif (FLOP + RackNerd + Delphi)"}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"CONFIG: webhook boot test OK {resp.status}", flush=True)
+        except Exception as e:
+            print(f"CONFIG: webhook boot test FAIL {type(e).__name__}", flush=True)
+    except Exception as e:
+        print(f"CONFIG FAIL: {type(e).__name__} — webhook stays off", flush=True)
+
+
 print(f"=== Jo-box test {VERSION} — triple watcher ===", flush=True)
 print("python:", sys.version.split()[0], flush=True)
 print("platform:", platform.platform(), flush=True)
@@ -353,6 +400,8 @@ if git and not os.path.isdir(".git"):
     print("files after boot:", sorted(os.listdir(".")), flush=True)
 elif os.path.isdir(".git"):
     print("BOOT: .git already present — already a checkout", flush=True)
+
+load_private_config()
 
 for url in ("https://ifconfig.me/ip", "https://api.github.com/"):
     try:
