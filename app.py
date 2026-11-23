@@ -1,4 +1,4 @@
-"""Jo-box app v5.2: triple watcher — FLOP, RackNerd, Delphi (24/7).
+"""Jo-box app v5.2.1: triple watcher — FLOP, RackNerd, Delphi (24/7).
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.2"
+VERSION = "v5.2.1"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -97,6 +97,8 @@ def alert(source, msg):
                                          headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as r:
                 log(f"WEBHOOK OK {r.status}", flush=True)
+        except urllib.error.HTTPError as e:
+            log(f"WEBHOOK FAIL: HTTPError {e.code}", flush=True)
         except Exception as e:
             log(f"WEBHOOK FAIL: {type(e).__name__}: {e}", flush=True)
 
@@ -357,7 +359,7 @@ def load_private_config():
                        timeout=30, capture_output=True, text=True)
         with open("config/config.json") as f:
             cfg = json.load(f)
-        hook = cfg.get("DISCORD_WEBHOOK", "")
+        hook = cfg.get("DISCORD_WEBHOOK", "").strip()
         if not hook.startswith("https://discord.com/api/webhooks/"):
             print("CONFIG: config.json has no valid DISCORD_WEBHOOK — webhook stays off", flush=True)
             return
@@ -370,6 +372,8 @@ def load_private_config():
                 headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 print(f"CONFIG: webhook boot test OK {resp.status}", flush=True)
+        except urllib.error.HTTPError as e:
+            print(f"CONFIG: webhook boot test FAIL HTTPError {e.code}", flush=True)
         except Exception as e:
             print(f"CONFIG: webhook boot test FAIL {type(e).__name__}", flush=True)
     except Exception as e:
