@@ -1,4 +1,4 @@
-"""Jo-box app v5: triple watcher — FLOP, RackNerd, Delphi (24/7).
+"""Jo-box app v5.1: triple watcher — FLOP, RackNerd, Delphi (24/7).
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5"
+VERSION = "v5.1"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -77,8 +77,8 @@ def save_state():
         print(f"STATE FAIL: {e}", flush=True)
 
 
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def log(msg, flush=True):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=flush)
 
 
 def alert(source, msg):
