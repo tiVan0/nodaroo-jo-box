@@ -1,12 +1,16 @@
-"""Jo-box app v5.4.0: triple watcher + radar — FLOP, RackNerd, Delphi,
+"""Jo-box app v5.4.1: triple watcher + radar — FLOP, RackNerd, Delphi,
 flop_agent, bounty_radar, testnet_radar (24/7).
 
 - bounty_radar: every 60 min — NEW free bug-bounty/audit programs
   (Sherlock API JSON, Cantina embedded JSON, Code4rena tiles).
   Immunefi NOT readable (JS-only list) — skipped, see radar section.
 - testnet_radar: every 60 min — NEW incentivized testnets
-  (airdrops.io/latest filtered by "testnet", 99airdrops testnet list).
+  (airdrops.io/latest filtered by "testnet", 99airdrops testnet list,
+  airdropalert.com/testnet-airdrops as backup leg — airdrops.io 403s
+  from cloud egress IPs, verified 24 Nov 2026).
   Alert only for items never seen before (seen-set in state.json).
+  Radar source errors alert Discord ONCE on OK->ERR and ERR->OK
+  transitions (state["radar_errors"]); no spam while an error persists.
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -48,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.4.0"
+VERSION = "v5.4.1"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -86,12 +90,13 @@ state = {
     "flop_agent": {"status": "DORMANT", "testnet_open": False, "faucet_url": "", "inference_endpoint": "", "last_check": None},
     "bounty_radar": {"seen": []},
     "testnet_radar": {"seen": []},
+    "radar_errors": {},
     "alerts": [],
 }
 try:
     with open(STATE_FILE) as f:
         old = json.load(f)
-    for k in ("flop", "racknerd", "alerts", "flop_agent", "bounty_radar", "testnet_radar"):
+    for k in ("flop", "racknerd", "alerts", "flop_agent", "bounty_radar", "testnet_radar", "radar_errors"):
         if k in old:
             state[k] = old[k]
 except Exception:
@@ -248,7 +253,10 @@ def watch_flop_agent():
                 agent = dict(state["flop_agent"])
             markers = flop.get("markers") or []
             draft = flop.get("draft")
-            testnet_open = bool(draft is False and markers)
+            # Marker "live" eksplisit menang atas kata "Draft" nyasar
+            # (mis. di deskripsi link-preview halaman testnet): testnet
+            # sudah buka begitu marker live muncul, walau draft=True.
+            testnet_open = bool(markers) and (draft is False or "live" in markers)
             status = agent.get("status", "DORMANT")
             with _lock:
                 state["flop_agent"].update({
@@ -428,10 +436,18 @@ def watch_racknerd(cfg):
 #   * airdrops.io/latest (HTML, kartu artikel) — filter: teks kartu
 #     mengandung "testnet". Kartu tidak membawa tanggal, jadi "baru" =
 #     slug yang belum pernah terlihat di daftar ini.
+#     PERINGATAN (24 Nov 2026): airdrops.io mengembalikan 403 dari
+#     egress cloud (box Nodaroo + box jo-companion), padahal 200 dari VM
+#     — blokir IP datacenter oleh Cloudflare; varian header (Referer,
+#     Accept-Language, Sec-Fetch) tidak membantu. Kaki ini best-effort.
 #   * 99airdrops.com/testnet-airdrops (HTML, daftar khusus testnet, 34 item).
-# Sumber yang DICOBA dan DITOLAK: cryptorank.io/airdrops (empty reply dari
-# VM, tidak stabil), airdropalert.com (tidak dipakai — dua sumber di atas
-# sudah stabil dibaca stdlib), https://airdrops.io/testnets/ (404).
+#   * airdropalert.com/testnet-airdrops (v5.4.1, kaki cadangan — 200 dari
+#     VM DAN box jo-companion; daftar khusus testnet, 12 item/halaman,
+#     halaman 1-2 dipindai).
+# Sumber yang DICOBA dan DITOLAK: cryptorank.io/airdrops (403 dari VM dan
+# box), coingecko.com/en/airdrops (403), airdropking.io (redirect ke
+# marketdigest.io 522), https://airdrops.io/testnets/ (404),
+# icodrops.com/airdrops/ (404).
 RADAR_INTERVAL = 3600  # 60 menit
 
 
@@ -533,6 +549,29 @@ def _airdrops99_testnets():
     return out
 
 
+def _airdropalert_testnets():
+    """Daftar testnet dari https://airdropalert.com/testnet-airdrops/
+    (HTML server-rendered, halaman 1-2; 12 item/halaman). Halaman 1 wajib
+    berhasil; halaman 2 best-effort (gagal -> pakai hasil halaman 1)."""
+    out = []
+    for pno in (1, 2):
+        url = ("https://airdropalert.com/testnet-airdrops/" if pno == 1
+               else f"https://airdropalert.com/testnet-airdrops/page/{pno}/")
+        try:
+            status, body = fetch(url)
+            page = body.decode("utf-8", "ignore")
+        except Exception:
+            if pno == 1:
+                raise
+            break
+        for slug in re.findall(r'href="https://airdropalert\.com/airdrops/([a-z0-9-]+)/"', page):
+            if any(o["slug"] == slug for o in out):
+                continue
+            out.append({"slug": slug, "name": slug.replace("-", " ").title(),
+                        "url": f"https://airdropalert.com/airdrops/{slug}/"})
+    return out
+
+
 def _radar_seen(key):
     return set(state[key]["seen"])
 
@@ -541,6 +580,28 @@ def _radar_save(key, seen):
     with _lock:
         state[key]["seen"] = sorted(seen)[-500:]
     save_state()
+
+
+def _radar_source(radar_key, source, ok, short, detail=""):
+    """Lacak status satu sumber radar; alert Discord SEKALI saat transisi
+    OK->ERR dan ERR->OK (status tersimpan di state['radar_errors']).
+    Tidak spam bila error menetap: hanya transisi yang alert.
+    Kembalikan note singkat untuk set_watcher. Dipanggil sekali per
+    siklus per sumber, di jalur sukses maupun gagal."""
+    key = f"{radar_key}:{source}"
+    with _lock:
+        errs = state.setdefault("radar_errors", {})
+        prev = errs.get(key, "ok")
+        errs[key] = "ok" if ok else f"ERR {short}"
+    save_state()
+    if ok and prev != "ok":
+        alert(radar_key, f"RADAR PULIH [{source}] {radar_key}: {detail or 'ok lagi'} (sebelumnya {prev})")
+    elif not ok and prev == "ok":
+        hint = ""
+        if source == "airdrops.io" and "403" in (detail or ""):
+            hint = " (kemungkinan blokir IP datacenter oleh Cloudflare; kaki cadangan airdropalert tetap jalan)"
+        alert(radar_key, f"RADAR ERROR [{source}] {radar_key}: {detail or short}{hint}")
+    return f"{source} {'ok' if ok else 'ERR ' + short}"
 
 
 def watch_bounty_radar():
@@ -563,6 +624,7 @@ def watch_bounty_radar():
                         start = time.strftime("%Y-%m-%d", time.gmtime(it["starts_at"])) if it.get("starts_at") else "?"
                         alerts.append(f"BOUNTY BARU [Sherlock] {it.get('title', '?')} — {it.get('type_label', '')}, pool {pool_s}, status {it.get('status', '?')}, mulai {start} — https://audits.sherlock.xyz/contests/{it.get('id')} — fee: cek fee dulu (tidak ada info fee di data)")
                 _radar_save("bounty_radar", seen)
+                _radar_source("bounty_radar", "sherlock", True, "ok")
                 # Tripwire: /api/contests/stats — API daftar hanya memuat
                 # FINISHED, jadi perubahan hitungan per status adalah satu-
                 # satunya sinyal kontes live baru.
@@ -578,14 +640,16 @@ def watch_bounty_radar():
                         diffs += [f"{k} {prev.get(k, 0)}→0 (hilang)" for k in prev if k not in stats]
                         alerts.append(f"SHERLOCK STATS BERUBAH: {', '.join(diffs)} — ada kontes baru/berubah status (API daftar hanya memuat kontes FINISHED, detail tidak tersedia) — cek https://audits.sherlock.xyz/contests")
                     notes.append(f"sherlock ok ({len(seen)} seen, stats={stats})")
+                    _radar_source("bounty_radar", "sherlock-stats", True, "ok")
                 except Exception as e:
-                    notes.append(f"sherlock stats ERR {type(e).__name__}")
+                    notes.append(_radar_source("bounty_radar", "sherlock-stats", False, type(e).__name__, f"{type(e).__name__}: {e}"))
                     log(f"BOUNTY_RADAR sherlock stats ERR: {type(e).__name__}: {e}", flush=True)
             except Exception as e:
-                notes.append(f"sherlock ERR {type(e).__name__}")
+                notes.append(_radar_source("bounty_radar", "sherlock", False, type(e).__name__, f"{type(e).__name__}: {e}"))
                 log(f"BOUNTY_RADAR sherlock ERR: {type(e).__name__}: {e}", flush=True)
             # --- Cantina (kompetisi + bounty, JSON ter-embed) ---
             try:
+                cantina_cf = None
                 for label, url, fee_field, pages in (
                     ("Cantina-kompetisi", "https://cantina.xyz/opportunities/competitions", "entryFee", 1),
                     # Bounty: ?page= diabaikan server (terverifikasi 24 Nov 2026:
@@ -599,7 +663,7 @@ def watch_bounty_radar():
                             items = _extract_cantina_items(body.decode("utf-8", "ignore"))
                         except urllib.error.HTTPError as e:
                             if e.code in (403, 429):
-                                notes.append(f"{label} CLOUDFLARE {e.code}")
+                                cantina_cf = f"{label} CLOUDFLARE {e.code}"
                                 break
                             raise
                         seen = _radar_seen("bounty_radar")
@@ -623,9 +687,13 @@ def watch_bounty_radar():
                             end = (tf.get("end") or "?")[:10]
                             alerts.append(f"BOUNTY BARU [{label}] {it.get('name', '?')} — {it.get('company', {}).get('name', '')}, pool {pot} {cur}, status {it.get('status', '?')}, {str(tf.get('start', '?'))[:10]} s.d. {end} — {it.get('url', '')} — fee: {fee_s}")
                         _radar_save("bounty_radar", seen)
-                notes.append("cantina ok")
+                if cantina_cf:
+                    notes.append(_radar_source("bounty_radar", "cantina", False, cantina_cf, f"Cantina {cantina_cf}"))
+                else:
+                    notes.append("cantina ok")
+                    _radar_source("bounty_radar", "cantina", True, "ok")
             except Exception as e:
-                notes.append(f"cantina ERR {type(e).__name__}")
+                notes.append(_radar_source("bounty_radar", "cantina", False, type(e).__name__, f"{type(e).__name__}: {e}"))
                 log(f"BOUNTY_RADAR cantina ERR: {type(e).__name__}: {e}", flush=True)
             # --- Code4rena (tile HTML) ---
             try:
@@ -644,8 +712,9 @@ def watch_bounty_radar():
                     alerts.append(f"BOUNTY BARU [Code4rena] {name} — status {it['status']}, hadiah {it['prize'] or '?'} — {it['url']} — fee: cek fee dulu (tidak ada info fee di data)")
                 _radar_save("bounty_radar", seen)
                 notes.append("c4 ok")
+                _radar_source("bounty_radar", "c4", True, "ok")
             except Exception as e:
-                notes.append(f"c4 ERR {type(e).__name__}")
+                notes.append(_radar_source("bounty_radar", "c4", False, type(e).__name__, f"{type(e).__name__}: {e}"))
                 log(f"BOUNTY_RADAR c4 ERR: {type(e).__name__}: {e}", flush=True)
             for msg in alerts:
                 alert("bounty_radar", msg)
@@ -675,8 +744,9 @@ def watch_testnet_radar():
                         alerts.append(f"TESTNET BARU [airdrops.io] {it['name']} — {it['url']} — insentif: cek halaman proyek (kartu menyebut testnet)")
                 _radar_save("testnet_radar", seen)
                 notes.append("airdrops.io ok")
+                _radar_source("testnet_radar", "airdrops.io", True, "ok")
             except Exception as e:
-                notes.append(f"airdrops.io ERR {type(e).__name__}")
+                notes.append(_radar_source("testnet_radar", "airdrops.io", False, type(e).__name__, f"{type(e).__name__}: {e}"))
                 log(f"TESTNET_RADAR airdrops.io ERR: {type(e).__name__}: {e}", flush=True)
             # --- 99airdrops /testnet-airdrops ---
             try:
@@ -690,9 +760,30 @@ def watch_testnet_radar():
                         alerts.append(f"TESTNET BARU [99airdrops] {it['name']} — {it['url']} — insentif: cek halaman proyek (daftar testnet 99airdrops)")
                 _radar_save("testnet_radar", seen)
                 notes.append("99airdrops ok")
+                _radar_source("testnet_radar", "99airdrops", True, "ok")
             except Exception as e:
-                notes.append(f"99airdrops ERR {type(e).__name__}")
+                notes.append(_radar_source("testnet_radar", "99airdrops", False, type(e).__name__, f"{type(e).__name__}: {e}"))
                 log(f"TESTNET_RADAR 99airdrops ERR: {type(e).__name__}: {e}", flush=True)
+            # --- airdropalert.com/testnet-airdrops (kaki cadangan v5.4.1) ---
+            try:
+                seen = _radar_seen("testnet_radar")
+                # Baseline per-sumber: kaki baru pertama kali jalan tidak
+                # alert untuk item lama (seen-set lama belum punya kunci
+                # "airdropalert:" sama sekali) — hanya simpan.
+                aa_baseline = not any(k.startswith("airdropalert:") for k in seen)
+                for it in _airdropalert_testnets():
+                    key = f"airdropalert:{it['slug']}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not baseline and not aa_baseline:
+                        alerts.append(f"TESTNET BARU [airdropalert] {it['name']} — {it['url']} — insentif: cek halaman proyek (daftar testnet airdropalert)")
+                _radar_save("testnet_radar", seen)
+                notes.append("airdropalert ok")
+                _radar_source("testnet_radar", "airdropalert", True, "ok")
+            except Exception as e:
+                notes.append(_radar_source("testnet_radar", "airdropalert", False, type(e).__name__, f"{type(e).__name__}: {e}"))
+                log(f"TESTNET_RADAR airdropalert ERR: {type(e).__name__}: {e}", flush=True)
             for msg in alerts:
                 alert("testnet_radar", msg)
             set_watcher("testnet_radar", "; ".join(notes) + (f"; {len(alerts)} alert baru" if alerts else ""))
