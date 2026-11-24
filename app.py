@@ -1,5 +1,12 @@
-"""Jo-box app v5.3.0: triple watcher — FLOP, RackNerd, Delphi (24/7)
-+ FLOP agent scaffold (DORMANT until the testnet opens).
+"""Jo-box app v5.4.0: triple watcher + radar — FLOP, RackNerd, Delphi,
+flop_agent, bounty_radar, testnet_radar (24/7).
+
+- bounty_radar: every 60 min — NEW free bug-bounty/audit programs
+  (Sherlock API JSON, Cantina embedded JSON, Code4rena tiles).
+  Immunefi NOT readable (JS-only list) — skipped, see radar section.
+- testnet_radar: every 60 min — NEW incentivized testnets
+  (airdrops.io/latest filtered by "testnet", 99airdrops testnet list).
+  Alert only for items never seen before (seen-set in state.json).
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -28,6 +35,7 @@ import html.parser
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -40,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.3.0"
+VERSION = "v5.4.0"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -54,6 +62,8 @@ CONFIG = {
         "main": {"base": "https://lowendtalk.com/discussion/221872/giveaway-by-adminbolt-racknerd-100x-free-vps-for-a-year-20x-lifetime-licenses-lets-talk", "page": 172},
         "interval": 120,
     },
+    "bounty_radar": {"interval": 3600},
+    "testnet_radar": {"interval": 3600},
 }
 
 STATE_FILE = "state.json"
@@ -74,12 +84,14 @@ state = {
     "flop": {"markers": [], "draft": None},
     "racknerd": {"bf_page": 296, "main_page": 172, "seen": []},
     "flop_agent": {"status": "DORMANT", "testnet_open": False, "faucet_url": "", "inference_endpoint": "", "last_check": None},
+    "bounty_radar": {"seen": []},
+    "testnet_radar": {"seen": []},
     "alerts": [],
 }
 try:
     with open(STATE_FILE) as f:
         old = json.load(f)
-    for k in ("flop", "racknerd", "alerts", "flop_agent"):
+    for k in ("flop", "racknerd", "alerts", "flop_agent", "bounty_radar", "testnet_radar"):
         if k in old:
             state[k] = old[k]
 except Exception:
@@ -374,6 +386,321 @@ def watch_racknerd(cfg):
         time.sleep(wait)
 
 
+# --- Radar bounty + testnet (v5.4.0) ----------------------------------------
+# Dua poller ringan (interval 60 menit), pola sama seperti watcher lain:
+# seen-set di state.json, alert HANYA untuk item BARU, baseline di siklus
+# pertama (tidak ada alert saat pertama kali jalan). Baseline dihitung
+# sekali per siklus, sebelum sumber pertama, supaya tidak ada sumber yang
+# alert di siklus pertama hanya karena sumber sebelumnya sudah menyimpan.
+#
+# watch_bounty_radar — program bounty BARU yang submission-nya gratis:
+#   * Sherlock: API JSON publik https://audits.sherlock.xyz/api/contests
+#     (?per_page=100, paginasi via next_page; total ~301, 4 halaman).
+#     Item: id/title/status/type_label/prize_pool/token/starts_at/ends_at.
+#     Link kontes: https://audits.sherlock.xyz/contests/<id> (terverifikasi
+#     HTTP 200). Urutan API tidak jelas, jadi SEMUA halaman dipindai tiap
+#     siklus dan seen-set yang memutuskan "baru".
+#     PERINGATAN (riset 24 Nov 2026): API daftar HANYA memuat kontes FINISHED
+#     (301) — /api/contests/stats melaporkan RUNNING:1 yang tidak pernah
+#     muncul di daftar (filter ?status=RUNNING mengembalikan 0 item).
+#     Karena itu thread juga memantau /api/contests/stats sebagai tripwire:
+#     bila hitungan per status berubah vs siklus sebelumnya, alert dikirim
+#     (tanpa detail — detailnya tidak tersedia dari API) supaya Jo mengecek
+#     situsnya langsung.
+#   * Cantina: halaman /opportunities/competitions dan /opportunities/bounties
+#     meng-embed array JSON `items` (RSC payload, string JSON di-escape).
+#     Item: id/name/url/status/totalRewardPot/currencyCode/timeframe +
+#     entryFee (kompetisi) / submissionFee (bounty). Kompetisi: semua item
+#     saat ini (2) ada di halaman; bounty: halaman 1 saja (10 dari 52,
+#     urut pot terbesar) — ?page= diabaikan server (terverifikasi).
+#   * Code4rena: halaman /audits (tile HTML) — slug/status/prize.
+#     Alert hanya bila status BUKAN Completed (Live/Upcoming/Judging/
+#     In progress). Saat riset (24 Nov 2026) halaman hanya memuat 50 audit
+#     Completed — bila audit live muncul di halaman ini, radar menangkapnya;
+#     bila C4 menaruh audit live di rute lain, itu keterbatasan yang dicatat.
+#   * Immunefi: TIDAK BISA — halaman /bug-bounty/ hanya me-render 10 program
+#     featured; daftar penuh (152 program) dimuat client-side via JS, tidak
+#     ada API publik yang ditemukan dan tidak ada sitemap. Dilewati.
+#   Fee: TIDAK ADA alert yang mengklaim "gratis" tanpa bukti. Bila data
+#   tidak memuat info fee -> "cek fee dulu". Bila data Cantina memuat
+#   entryFee/submissionFee -> nilainya dicantumkan apa adanya.
+# watch_testnet_radar — testnet BERINSENTIF baru:
+#   * airdrops.io/latest (HTML, kartu artikel) — filter: teks kartu
+#     mengandung "testnet". Kartu tidak membawa tanggal, jadi "baru" =
+#     slug yang belum pernah terlihat di daftar ini.
+#   * 99airdrops.com/testnet-airdrops (HTML, daftar khusus testnet, 34 item).
+# Sumber yang DICOBA dan DITOLAK: cryptorank.io/airdrops (empty reply dari
+# VM, tidak stabil), airdropalert.com (tidak dipakai — dua sumber di atas
+# sudah stabil dibaca stdlib), https://airdrops.io/testnets/ (404).
+RADAR_INTERVAL = 3600  # 60 menit
+
+
+def _extract_cantina_items(html):
+    """Ambil array `items` dari JSON yang di-embed di halaman Cantina
+    (RSC payload: string JSON yang di-escape). Kembalikan list dict."""
+    marker = '\\"items\\":['
+    i = html.find(marker)
+    if i < 0:
+        return []
+    j = html.find("[", i)
+    depth = 0
+    k = j
+    while k < len(html):
+        c = html[k]
+        if c == "\\":
+            k += 2
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    if depth != 0:
+        return []
+    raw = html[j:k + 1]
+    try:
+        return json.loads(raw.replace('\\"', '"'))
+    except Exception:
+        return []
+
+
+def _sherlock_contests():
+    """Semua kontes Sherlock via API JSON publik (100/page, paginasi)."""
+    out = []
+    page = 1
+    while page <= 10:
+        status, body = fetch(f"https://audits.sherlock.xyz/api/contests?per_page=100&page={page}")
+        if status != 200:
+            raise RuntimeError(f"Sherlock API HTTP {status}")
+        d = json.loads(body.decode("utf-8", "ignore"))
+        items = d.get("items") or []
+        out.extend(items)
+        if not d.get("has_next"):
+            break
+        page = d.get("next_page") or page + 1
+    return out
+
+
+def _c4_audits():
+    """Audit Code4rena dari halaman /audits (tile HTML)."""
+    status, body = fetch("https://code4rena.com/audits")
+    html = body.decode("utf-8", "ignore")
+    out = []
+    for href, inner in re.findall(r'<a class="audit-tile__link" href="([^"]+)">(.*?)</a>', html, re.S):
+        txt = re.sub(r"<[^>]+>", "|", inner)
+        m = re.search(r"\|\s*(Live|Upcoming|Completed|Judging|In progress|Cancelled)\b", txt)
+        st = m.group(1) if m else "?"
+        prize = re.search(r"\$[\d,]+(?:\.\d+)?(?:\s*in\s*[A-Z]+)?", txt)
+        slug = href.rsplit("/", 1)[-1]
+        out.append({
+            "slug": slug,
+            "url": "https://code4rena.com" + href,
+            "status": st,
+            "prize": prize.group(0) if prize else "",
+        })
+    return out
+
+
+def _airdrops_io_latest():
+    """Kartu-kartu terbaru dari https://airdrops.io/latest/ (HTML)."""
+    status, body = fetch("https://airdrops.io/latest/")
+    page = body.decode("utf-8", "ignore")
+    out = []
+    for art in re.findall(r"<article[^>]*>(.*?)</article>", page, re.S):
+        links = re.findall(r'href="(https://airdrops\.io/([a-z0-9-]+)/)"', art)
+        if not links:
+            continue
+        url, slug = links[0]
+        name = re.search(r"<h[23][^>]*>(.*?)</h[23]>", art, re.S)
+        name = re.sub(r"<[^>]+>", "", name.group(1)).strip() if name else slug
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", art)).strip()
+        out.append({"slug": slug, "name": html.unescape(name), "url": url, "text": text})
+    return out
+
+
+def _airdrops99_testnets():
+    """Daftar testnet dari https://99airdrops.com/testnet-airdrops/ (HTML)."""
+    status, body = fetch("https://99airdrops.com/testnet-airdrops/")
+    html = body.decode("utf-8", "ignore")
+    out = []
+    for slug in re.findall(r'href="/airdrops/([a-z0-9-]+)/"', html):
+        if any(o["slug"] == slug for o in out):
+            continue
+        out.append({"slug": slug, "name": slug.replace("-", " ").title(),
+                    "url": f"https://99airdrops.com/airdrops/{slug}/"})
+    return out
+
+
+def _radar_seen(key):
+    return set(state[key]["seen"])
+
+
+def _radar_save(key, seen):
+    with _lock:
+        state[key]["seen"] = sorted(seen)[-500:]
+    save_state()
+
+
+def watch_bounty_radar():
+    while True:
+        try:
+            alerts = []
+            notes = []
+            baseline = not _radar_seen("bounty_radar")
+            # --- Sherlock (API JSON) ---
+            try:
+                seen = _radar_seen("bounty_radar")
+                for it in _sherlock_contests():
+                    key = f"sherlock:{it.get('id')}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not baseline:
+                        pool = it.get("prize_pool")
+                        pool_s = f"{pool:,} {it.get('token', '')}".strip() if isinstance(pool, (int, float)) else "?"
+                        start = time.strftime("%Y-%m-%d", time.gmtime(it["starts_at"])) if it.get("starts_at") else "?"
+                        alerts.append(f"BOUNTY BARU [Sherlock] {it.get('title', '?')} — {it.get('type_label', '')}, pool {pool_s}, status {it.get('status', '?')}, mulai {start} — https://audits.sherlock.xyz/contests/{it.get('id')} — fee: cek fee dulu (tidak ada info fee di data)")
+                _radar_save("bounty_radar", seen)
+                # Tripwire: /api/contests/stats — API daftar hanya memuat
+                # FINISHED, jadi perubahan hitungan per status adalah satu-
+                # satunya sinyal kontes live baru.
+                try:
+                    _, sbody = fetch("https://audits.sherlock.xyz/api/contests/stats")
+                    stats = {row["status"]: row["count"] for row in json.loads(sbody.decode("utf-8", "ignore"))}
+                    with _lock:
+                        prev = state["bounty_radar"].get("sherlock_stats") or {}
+                        state["bounty_radar"]["sherlock_stats"] = stats
+                    save_state()
+                    if prev and stats != prev:
+                        diffs = [f"{k} {prev.get(k, 0)}→{v}" for k, v in stats.items() if prev.get(k, 0) != v]
+                        diffs += [f"{k} {prev.get(k, 0)}→0 (hilang)" for k in prev if k not in stats]
+                        alerts.append(f"SHERLOCK STATS BERUBAH: {', '.join(diffs)} — ada kontes baru/berubah status (API daftar hanya memuat kontes FINISHED, detail tidak tersedia) — cek https://audits.sherlock.xyz/contests")
+                    notes.append(f"sherlock ok ({len(seen)} seen, stats={stats})")
+                except Exception as e:
+                    notes.append(f"sherlock stats ERR {type(e).__name__}")
+                    log(f"BOUNTY_RADAR sherlock stats ERR: {type(e).__name__}: {e}", flush=True)
+            except Exception as e:
+                notes.append(f"sherlock ERR {type(e).__name__}")
+                log(f"BOUNTY_RADAR sherlock ERR: {type(e).__name__}: {e}", flush=True)
+            # --- Cantina (kompetisi + bounty, JSON ter-embed) ---
+            try:
+                for label, url, fee_field, pages in (
+                    ("Cantina-kompetisi", "https://cantina.xyz/opportunities/competitions", "entryFee", 1),
+                    # Bounty: ?page= diabaikan server (terverifikasi 24 Nov 2026:
+                    # halaman 2 mengembalikan 10 item yang sama) — halaman 1
+                    # saja (10 dari 52, urut pot terbesar).
+                    ("Cantina-bounty", "https://cantina.xyz/opportunities/bounties", "submissionFee", 1),
+                ):
+                    for pno in range(1, pages + 1):
+                        try:
+                            _, body = fetch(url if pno == 1 else f"{url}?page={pno}")
+                            items = _extract_cantina_items(body.decode("utf-8", "ignore"))
+                        except urllib.error.HTTPError as e:
+                            if e.code in (403, 429):
+                                notes.append(f"{label} CLOUDFLARE {e.code}")
+                                break
+                            raise
+                        seen = _radar_seen("bounty_radar")
+                        for it in items:
+                            key = f"cantina:{it.get('id')}"
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            if baseline:
+                                continue
+                            if str(it.get("status", "")).lower() not in ("live", "upcoming", "open"):
+                                continue
+                            pot = it.get("totalRewardPot", "?")
+                            cur = it.get("currencyCode", "")
+                            fee = it.get(fee_field)
+                            if fee not in (None, "", "0.00", "0"):
+                                fee_s = f"cek fee dulu (data Cantina: {fee_field} ${fee} {cur})"
+                            else:
+                                fee_s = "cek fee dulu (tidak ada info fee di data)"
+                            tf = it.get("timeframe") or {}
+                            end = (tf.get("end") or "?")[:10]
+                            alerts.append(f"BOUNTY BARU [{label}] {it.get('name', '?')} — {it.get('company', {}).get('name', '')}, pool {pot} {cur}, status {it.get('status', '?')}, {str(tf.get('start', '?'))[:10]} s.d. {end} — {it.get('url', '')} — fee: {fee_s}")
+                        _radar_save("bounty_radar", seen)
+                notes.append("cantina ok")
+            except Exception as e:
+                notes.append(f"cantina ERR {type(e).__name__}")
+                log(f"BOUNTY_RADAR cantina ERR: {type(e).__name__}: {e}", flush=True)
+            # --- Code4rena (tile HTML) ---
+            try:
+                seen = _radar_seen("bounty_radar")
+                for it in _c4_audits():
+                    key = f"c4:{it['slug']}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if baseline:
+                        continue
+                    if it["status"] not in ("Live", "Upcoming", "Judging", "In progress"):
+                        continue
+                    parts = it["slug"].split("-", 2)
+                    name = parts[-1].replace("-", " ").title() if len(parts) == 3 and parts[0].isdigit() else it["slug"].replace("-", " ").title()
+                    alerts.append(f"BOUNTY BARU [Code4rena] {name} — status {it['status']}, hadiah {it['prize'] or '?'} — {it['url']} — fee: cek fee dulu (tidak ada info fee di data)")
+                _radar_save("bounty_radar", seen)
+                notes.append("c4 ok")
+            except Exception as e:
+                notes.append(f"c4 ERR {type(e).__name__}")
+                log(f"BOUNTY_RADAR c4 ERR: {type(e).__name__}: {e}", flush=True)
+            for msg in alerts:
+                alert("bounty_radar", msg)
+            set_watcher("bounty_radar", "; ".join(notes) + (f"; {len(alerts)} alert baru" if alerts else ""))
+        except Exception as e:
+            set_watcher("bounty_radar", f"ERR {type(e).__name__}: {e}")
+        time.sleep(RADAR_INTERVAL)
+
+
+def watch_testnet_radar():
+    while True:
+        try:
+            alerts = []
+            notes = []
+            baseline = not _radar_seen("testnet_radar")
+            # --- airdrops.io/latest (kartu testnet) ---
+            try:
+                seen = _radar_seen("testnet_radar")
+                for it in _airdrops_io_latest():
+                    if "testnet" not in it["text"].lower():
+                        continue
+                    key = f"airdropsio:{it['slug']}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not baseline:
+                        alerts.append(f"TESTNET BARU [airdrops.io] {it['name']} — {it['url']} — insentif: cek halaman proyek (kartu menyebut testnet)")
+                _radar_save("testnet_radar", seen)
+                notes.append("airdrops.io ok")
+            except Exception as e:
+                notes.append(f"airdrops.io ERR {type(e).__name__}")
+                log(f"TESTNET_RADAR airdrops.io ERR: {type(e).__name__}: {e}", flush=True)
+            # --- 99airdrops /testnet-airdrops ---
+            try:
+                seen = _radar_seen("testnet_radar")
+                for it in _airdrops99_testnets():
+                    key = f"99airdrops:{it['slug']}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not baseline:
+                        alerts.append(f"TESTNET BARU [99airdrops] {it['name']} — {it['url']} — insentif: cek halaman proyek (daftar testnet 99airdrops)")
+                _radar_save("testnet_radar", seen)
+                notes.append("99airdrops ok")
+            except Exception as e:
+                notes.append(f"99airdrops ERR {type(e).__name__}")
+                log(f"TESTNET_RADAR 99airdrops ERR: {type(e).__name__}: {e}", flush=True)
+            for msg in alerts:
+                alert("testnet_radar", msg)
+            set_watcher("testnet_radar", "; ".join(notes) + (f"; {len(alerts)} alert baru" if alerts else ""))
+        except Exception as e:
+            set_watcher("testnet_radar", f"ERR {type(e).__name__}: {e}")
+        time.sleep(RADAR_INTERVAL)
+
+
 class _Backoff(Exception):
     pass
 
@@ -471,7 +798,7 @@ def load_private_config():
         try:
             req = urllib.request.Request(
                 hook,
-                data=json.dumps({"content": f"Jo-box {VERSION} online — triple watcher + flop_agent aktif (FLOP + RackNerd + Delphi)"}).encode(),
+                data=json.dumps({"content": f"Jo-box {VERSION} online — watchers + radar aktif (FLOP + RackNerd + Delphi + bounty_radar + testnet_radar)"}).encode(),
                 headers={**UA, "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 print(f"CONFIG: webhook boot test OK {resp.status}", flush=True)
@@ -484,7 +811,7 @@ def load_private_config():
         print(f"CONFIG FAIL: {type(e).__name__} — webhook stays off", flush=True)
 
 
-print(f"=== Jo-box test {VERSION} — triple watcher ===", flush=True)
+print(f"=== Jo-box test {VERSION} — watchers + radar ===", flush=True)
 print("python:", sys.version.split()[0], flush=True)
 print("platform:", platform.platform(), flush=True)
 print("hostname:", socket.gethostname(), flush=True)
@@ -524,11 +851,13 @@ threading.Thread(target=watch_delphi, args=(CONFIG["delphi"],), daemon=True).sta
 threading.Thread(target=watch_flop, args=(CONFIG["flop"],), daemon=True).start()
 threading.Thread(target=watch_racknerd, args=(CONFIG["racknerd"],), daemon=True).start()
 threading.Thread(target=watch_flop_agent, daemon=True).start()
-log("WATCHERS started: delphi + flop + racknerd + flop_agent", flush=True)
+threading.Thread(target=watch_bounty_radar, daemon=True).start()
+threading.Thread(target=watch_testnet_radar, daemon=True).start()
+log("WATCHERS started: delphi + flop + racknerd + flop_agent + bounty_radar + testnet_radar", flush=True)
 save_state()
 
 n = 0
 while True:
     n += 1
-    print(f"heartbeat {n} - Jo-box hidup {n * 30} detik [{VERSION} triple watcher]", flush=True)
+    print(f"heartbeat {n} - Jo-box hidup {n * 30} detik [{VERSION} watchers + radar]", flush=True)
     time.sleep(30)
