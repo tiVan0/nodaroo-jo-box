@@ -1,4 +1,5 @@
-"""Jo-box app v5.2.2: triple watcher — FLOP, RackNerd, Delphi (24/7).
+"""Jo-box app v5.3.0: triple watcher — FLOP, RackNerd, Delphi (24/7)
++ FLOP agent scaffold (DORMANT until the testnet opens).
 
 - FLOP: GET https://flop.finance/testnet/ every 2 min (1 min in the
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
@@ -10,6 +11,11 @@
   back off 10 min. VM cron stays authoritative for RackNerd.
 - Delphi: GET https://competition.delphi.fyi/markets.json every 5 min;
   alert once when it answers 200 with real JSON (currently 404).
+- flop_agent: state machine DORMANT -> READY -> WAITING_FAUCET ->
+  ACTIVE -> PAUSED. While the testnet is closed it only reads the
+  open-markers watch_flop already tracks (state["flop"]) and logs.
+  Faucet/inference/signing integration points are TODO placeholders
+  (FAUCET_URL, INFERENCE_URL, sign_request) — no keys are ever read.
 Alert sinks: Discord webhook (DISCORD_WEBHOOK env, or config.json in the
 private repo tiVan0/jo-box-secrets, cloned at boot with USERNAME +
 ACCESS_TOKEN — the token is never logged or kept on disk),
@@ -34,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.2.2"
+VERSION = "v5.3.0"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -51,6 +57,15 @@ CONFIG = {
 }
 
 STATE_FILE = "state.json"
+
+# --- FLOP agent scaffold (v5.3.0) -------------------------------------------
+# Titik integrasi — TODO: isi setelah riset SDK FLOP selesai.
+# JANGAN implementasikan signing di sini, JANGAN baca kunci/seed apa pun
+# (mis. ~/workspace/flop/identity.seed) — agen tidak menyentuh kredensial.
+FAUCET_URL = ""       # TODO: URL faucet testnet FLOP (dari riset SDK)
+INFERENCE_URL = ""    # TODO: endpoint inference FLOP / flop-sdk (dari riset SDK)
+FLOP_SDK = ""         # TODO: nama + versi SDK resmi (mis. flop-sdk) dan cara
+                      # memanggilnya dari Python stdlib (dari riset SDK)
 _lock = threading.Lock()
 state = {
     "version": VERSION,
@@ -58,16 +73,26 @@ state = {
     "watchers": {},
     "flop": {"markers": [], "draft": None},
     "racknerd": {"bf_page": 296, "main_page": 172, "seen": []},
+    "flop_agent": {"status": "DORMANT", "testnet_open": False, "faucet_url": "", "inference_endpoint": "", "last_check": None},
     "alerts": [],
 }
 try:
     with open(STATE_FILE) as f:
         old = json.load(f)
-    for k in ("flop", "racknerd", "alerts"):
+    for k in ("flop", "racknerd", "alerts", "flop_agent"):
         if k in old:
             state[k] = old[k]
 except Exception:
     pass
+# Normalisasi flop_agent: state.json lama mungkin belum punya semua key.
+_fa = state.get("flop_agent", {})
+state["flop_agent"] = {
+    "status": _fa.get("status", "DORMANT"),
+    "testnet_open": _fa.get("testnet_open", False),
+    "faucet_url": _fa.get("faucet_url", ""),
+    "inference_endpoint": _fa.get("inference_endpoint", ""),
+    "last_check": _fa.get("last_check"),
+}
 
 
 def save_state():
@@ -173,6 +198,83 @@ def watch_flop(cfg):
         except Exception as e:
             set_watcher("flop", f"ERR {type(e).__name__}: {e}")
             wait = 120
+        time.sleep(wait)
+
+
+def sign_request(payload):
+    """TODO: tanda tangan request inference dengan DID agen (riset SDK FLOP).
+
+    JANGAN implementasikan sebelum riset SDK selesai. Fungsi ini TIDAK
+    dipanggil di mana pun dalam scaffold ini, dan TIDAK PERNAH membaca
+    kunci/seed dari disk (mis. ~/workspace/flop/identity.seed).
+    """
+    raise NotImplementedError("sign_request: TODO — menunggu hasil riset SDK FLOP")
+
+
+def set_agent_status(new_status, note=""):
+    """Pindah status flop_agent; alert via alert() hanya saat berubah."""
+    with _lock:
+        old = state["flop_agent"]["status"]
+        if old == new_status:
+            return False
+        state["flop_agent"]["status"] = new_status
+    save_state()
+    alert("flop_agent", f"FLOP AGENT: {old} -> {new_status} {note}".strip())
+    return True
+
+
+def watch_flop_agent():
+    """State machine agen FLOP: DORMANT -> READY -> WAITING_FAUCET ->
+    ACTIVE -> PAUSED. Selama testnet belum buka, thread ini HANYA membaca
+    penanda buka yang sudah dilacak watch_flop (state['flop']) + log;
+    tidak ada aksi lain, tidak ada request ke faucet/inference."""
+    errors = 0
+    while True:
+        try:
+            with _lock:
+                flop = dict(state["flop"])
+                agent = dict(state["flop_agent"])
+            markers = flop.get("markers") or []
+            draft = flop.get("draft")
+            testnet_open = bool(draft is False and markers)
+            status = agent.get("status", "DORMANT")
+            with _lock:
+                state["flop_agent"].update({
+                    "testnet_open": testnet_open,
+                    "faucet_url": FAUCET_URL,
+                    "inference_endpoint": INFERENCE_URL,
+                    "last_check": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+                })
+            errors = 0
+            if status == "PAUSED":
+                # Pulih ke DORMANT begitu pengecekan jalan normal lagi.
+                set_agent_status("DORMANT", "(pulih dari PAUSED)")
+                status = "DORMANT"
+            if status == "DORMANT" and testnet_open:
+                set_agent_status("READY", "(testnet terdeteksi buka)")
+                status = "READY"
+            elif status == "READY" and not testnet_open:
+                set_agent_status("DORMANT", "(penanda buka hilang lagi)")
+                status = "DORMANT"
+            if status == "READY":
+                if FAUCET_URL and INFERENCE_URL:
+                    # TODO: lanjut WAITING_FAUCET begitu riset SDK selesai.
+                    set_agent_status("WAITING_FAUCET", "(faucet + inference terkonfigurasi)")
+                    status = "WAITING_FAUCET"
+                else:
+                    set_watcher("flop_agent", "READY — menunggu FAUCET_URL/INFERENCE_URL (TODO riset SDK)")
+            elif status in ("WAITING_FAUCET", "ACTIVE"):
+                # TODO: klaim faucet -> beli inference (riset SDK).
+                set_watcher("flop_agent", f"{status} — TODO: implementasi menunggu riset SDK")
+            else:
+                set_watcher("flop_agent", f"DORMANT — testnet belum buka (markers={markers or 'none'}, draft={draft})")
+            wait = 60
+        except Exception as e:
+            errors += 1
+            set_watcher("flop_agent", f"ERR {type(e).__name__}: {e} (error beruntun: {errors})")
+            if errors >= 5 and state["flop_agent"]["status"] != "PAUSED":
+                set_agent_status("PAUSED", f"(5 error beruntun: {type(e).__name__})")
+            wait = 60
         time.sleep(wait)
 
 
@@ -369,7 +471,7 @@ def load_private_config():
         try:
             req = urllib.request.Request(
                 hook,
-                data=json.dumps({"content": "Jo-box v5.2.2 online — triple watcher aktif (FLOP + RackNerd + Delphi)"}).encode(),
+                data=json.dumps({"content": f"Jo-box {VERSION} online — triple watcher + flop_agent aktif (FLOP + RackNerd + Delphi)"}).encode(),
                 headers={**UA, "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 print(f"CONFIG: webhook boot test OK {resp.status}", flush=True)
@@ -421,7 +523,8 @@ threading.Thread(target=self_update_loop, daemon=True).start()
 threading.Thread(target=watch_delphi, args=(CONFIG["delphi"],), daemon=True).start()
 threading.Thread(target=watch_flop, args=(CONFIG["flop"],), daemon=True).start()
 threading.Thread(target=watch_racknerd, args=(CONFIG["racknerd"],), daemon=True).start()
-log("WATCHERS started: delphi + flop + racknerd", flush=True)
+threading.Thread(target=watch_flop_agent, daemon=True).start()
+log("WATCHERS started: delphi + flop + racknerd + flop_agent", flush=True)
 save_state()
 
 n = 0
