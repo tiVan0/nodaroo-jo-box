@@ -1,4 +1,4 @@
-"""Jo-box app v5.4.1: triple watcher + radar — FLOP, RackNerd, Delphi,
+"""Jo-box app v5.4.2: triple watcher + radar — FLOP, RackNerd, Delphi,
 flop_agent, bounty_radar, testnet_radar (24/7).
 
 - bounty_radar: every 60 min — NEW free bug-bounty/audit programs
@@ -16,7 +16,10 @@ flop_agent, bounty_radar, testnet_radar (24/7).
   launch window 24 Nov 12:00-18:00 WIB); alert once when a marker
   (faucet/explorer/setup/claim/live) first appears or "draft" goes away.
 - RackNerd: poll both LowEndTalk threads every 2 min; alert only on a
-  NEW post by dustinc announcing a giveaway (giveaway / next 5 / next 10).
+  NEW post by dustinc announcing a round: his own words (quotes stripped)
+  with "first/next N" + (eligible|screenshot|photo|"shall receive");
+  bandwidth confirmations never match (fixed 25 Nov 2026 — a quoted
+  member "giveaway" caused false alerts on p404/p414).
   Comment text is extracted first — never raw body hash (dynamic content
   false-positives). Cloudflare 403/429 means "unknown", never "no round";
   back off 10 min. VM cron stays authoritative for RackNerd.
@@ -52,7 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = "https://github.com/tiVan0/nodaroo-jo-box"
 ALLOC_PORT = 25753  # se2.nodaroo.fun:25753
-VERSION = "v5.4.1"
+VERSION = "v5.4.2"
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
 CONFIG = {
@@ -308,11 +311,13 @@ class LETParser(html.parser.HTMLParser):
         self._in_user = False
         self._in_msg = False
         self._depth = 0
+        self._quote = 0
         self._buf = []
 
     def handle_starttag(self, tag, attrs):
         cls = dict(attrs).get("class", "")
-        if tag == "a" and "Username" in cls:
+        if tag == "a" and "Username" in cls and self._quote == 0:
+            # A quoted member's name must never overwrite the comment author.
             self._in_user = True
         if tag == "div" and "Message" in cls:
             if not self._in_msg:
@@ -323,14 +328,21 @@ class LETParser(html.parser.HTMLParser):
                 self._depth += 1
         elif self._in_msg and tag == "div":
             self._depth += 1
+        if self._in_msg and tag == "blockquote":
+            # Quoted parent post: NOT the author's own words — a member's
+            # "giveaway" inside a quote must never trigger a round alert.
+            self._quote += 1
 
     def handle_endtag(self, tag):
+        if tag == "blockquote" and self._quote > 0:
+            self._quote -= 1
         if tag == "a" and self._in_user:
             self._in_user = False
         if tag == "div" and self._in_msg:
             self._depth -= 1
             if self._depth <= 0:
                 self._in_msg = False
+                self._quote = 0
                 text = " ".join("".join(self._buf).split())
                 if self._author and text:
                     self.comments.append((self._author, text))
@@ -339,7 +351,7 @@ class LETParser(html.parser.HTMLParser):
     def handle_data(self, data):
         if self._in_user:
             self._author = data.strip()
-        if self._in_msg:
+        if self._in_msg and self._quote == 0:
             self._buf.append(data)
 
 
@@ -351,7 +363,17 @@ def let_comments(url):
 
 
 def watch_racknerd(cfg):
-    giveaway_kw = ("giveaway", "next 5", "next 10")
+    # A real round announcement, in dustinc's OWN words (LETParser strips
+    # <blockquote> quotes, so a member's "giveaway" inside a quote can't
+    # trigger): an entry rule "first/next N" + (eligible|screenshot|photo|
+    # "shall receive"). Bandwidth confirmations ("bandwidth"/"doubled"/
+    # "order #") never match. "giveaway" alone is NOT a trigger — it fired
+    # on quoted member posts (p404 azmi_my, p414 zjuer, 25 Nov 2026) and on
+    # teasers/winners posts. VM cron stays the authoritative backstop for
+    # any round phrased differently.
+    round_num = re.compile(r"\b(?:first|next)\s+\d+\b")
+    round_word = ("eligible", "screenshot", "photo", "shall receive")
+    bw_word = ("bandwidth", "doubled", "order #", "invoice")
     while True:
         try:
             for key in ("bf", "main"):
@@ -380,7 +402,10 @@ def watch_racknerd(cfg):
                             continue
                         seen.add(k)
                         low = text.lower()
-                        if not baseline and author.lower() == "dustinc" and any(w in low for w in giveaway_kw):
+                        is_round = (bool(round_num.search(low))
+                                    and any(w in low for w in round_word)
+                                    and not any(w in low for w in bw_word))
+                        if not baseline and author.lower() == "dustinc" and is_round:
                             alert("racknerd", f"RONDE BARU? dustinc di {key} p{pno}: {text[:200]} — {url}")
                     with _lock:
                         state["racknerd"]["seen"] = sorted(seen)[-500:]
